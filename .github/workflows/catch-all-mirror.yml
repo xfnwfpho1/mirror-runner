@@ -234,9 +234,15 @@ jobs:
           OWNER="${GITHUB_REPOSITORY_OWNER}"
           META="${META_NAME:-$OWNER}"
           RUN_ID="${GITHUB_RUN_ID}"
+          # aggregate job conclusions (querying the run itself reports
+          # "in_progress" because this report job is part of it)
           CONCLUSION="$(curl -sS -H "Authorization: token $GH_PAT" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/$RUN_ID" \
-            | jq -r '.conclusion // .status')"
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/$RUN_ID/jobs" \
+            | jq -r '[.jobs[] | select(.name | startswith("Record") | not) | .conclusion]
+                     | if (length == 0) then "unknown"
+                       elif any(. == null) then "in_progress"
+                       elif all(. == "success") then "success"
+                       else "failure" end')"
           TS=$(date -u +%FT%TZ)
           STATUS=$(printf '{"ts":"%s","run_id":"%s","url":"https://github.com/%s/actions/runs/%s","conclusion":"%s","repos_total":"%s","need_attention":"%s","in_sync":"%s"}\n' \
             "$TS" "$RUN_ID" "$GITHUB_REPOSITORY" "$RUN_ID" "$CONCLUSION" \
