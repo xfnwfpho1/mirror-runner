@@ -117,8 +117,9 @@ jobs:
             defbr=$(echo "$repos" | jq -r --arg s "$slug" '.[] | select(.full_name==$s) | .default_branch // empty')
             defsha=$(echo "$gh_br" | jq -r --arg b "$defbr" '.[] | select(.name==$b) | .commit.sha // empty')
 
-            gl="missing"
+            gl="disabled"   # blob-only mode: never flag as needing GL repair
             if [ -n "$GL_PAT" ]; then
+              gl="missing"
               proj_enc=$(echo -n "${GL_NAMESPACE}/${name}" | jq -sRr @uri)
               gl_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -H "PRIVATE-TOKEN: $GL_PAT" "https://gitlab.com/api/v4/projects/$proj_enc")
               if [ "$gl_code" = "200" ]; then
