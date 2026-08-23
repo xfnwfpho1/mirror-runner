@@ -166,6 +166,7 @@ jobs:
     if: needs.plan.outputs.count != '0'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    name: mirror repo-${{ matrix.i }}
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -241,7 +242,8 @@ jobs:
 
           # 1) marker commit HERE (public repo): keeps repo active so the
           #    60-day scheduled-workflow auto-disable never triggers
-          git config --global user.name "mirror-runner" user.email "runner@users.noreply.github.com" --replace-all
+          git config --global user.name "mirror-runner"
+          git config --global user.email "runner@users.noreply.github.com"
           git config --global init.defaultBranch main
           git clone -q "https://x-access-token:${GH_PAT}@github.com/${GITHUB_REPOSITORY}.git" self
           ( cd self
