@@ -140,9 +140,9 @@ jobs:
 
             if [ "${FORCE_FULL}" = "true" ] || { [ "$gl" != "ok" ] && [ "$gl" != "disabled" ]; } || { [ "$blob" != "ok" ] && [ "$blob" != "disabled" ]; }; then
               idx=$((idx+1))
-              matrix=$(echo "$matrix" | jq -c --arg slug "$slug" --arg name "$name" --arg gl "$gl" --arg blob "$blob" \
+              matrix=$(echo "$matrix" | jq -c --arg slug "$slug" --arg slug_b64 "$(echo -n "$slug" | base64 -w0)" --arg name "$name" --arg gl "$gl" --arg blob "$blob" \
                 --arg def "$defbr" --arg sha "$defsha" --argjson i "$idx" \
-                '. += [{i:$i, slug:$slug, name:$name, gl:$gl, blob:$blob, default_branch:$def, default_sha:$sha}]')
+                '. += [{i:$i, slug_b64:$slug_b64, name:$name, gl:$gl, blob:$blob, default_branch:$def, default_sha:$sha}]')
               count=$((count+1))
             else
               skipped=$((skipped+1))
@@ -191,31 +191,33 @@ jobs:
 
       - name: Mirror repo-${{ matrix.i }}
         env:
-          SLUG: ${{ matrix.slug }}
+          SLUG_B64: ${{ matrix.slug_b64 }}
           DEFSHA: ${{ matrix.default_sha }}
           GLSTATE: ${{ matrix.gl }}
           IDX: ${{ matrix.i }}
         run: |
           set -euo pipefail
+          SLUG=$(echo "$SLUG_B64" | base64 -d)
           # expect-sha early-exit is only safe when GL was already verified
           # in-sync by plan (gl=ok). If gl=drift/missing we MUST do the work.
           EXTRA=""
-          [ "$GLSTATE" = "ok" ] && EXTRA="--expect-sha $DEFSHA"
+          [ "$GLSTATE" = "ok" ] && EXTRA="--expect-sha $DEFSHA" || true
           OUT=$(bash "$GITHUB_WORKSPACE/kit/scripts/mirror_core.sh" \
             --source "$SLUG" --gh-pat "$GH_TOKEN" $EXTRA --bundle 2>&1) || true
           GL_LINE=$(echo "$OUT"  | grep -o 'GL=[a-z-]*'  | tail -1 || echo "GL=unknown")
           BLOB_LINE=$(echo "$OUT" | grep -o 'BLOB=[a-z-]*' | tail -1 || echo "BLOB=unknown")
           CHAIN_LINE=$(echo "$OUT" | grep -o 'blob chain: mode=[a-z]*' | tail -1 || true)
           # public log: indexes only — mask the slug everywhere
-          MASKED=$(echo "$OUT" | sed "s#${SLUG//./\\.}#repo-${IDX}#g")
+          MASKED=$(echo "$OUT" | sed "s#${SLUG//./\.}#repo-${IDX}#g")
           if [ "${GL_LINE#GL=}" = "failed" ] || [ "${BLOB_LINE#BLOB=}" = "failed" ]; then
             echo "$MASKED" | tail -20   # failure detail, masked
           else
             echo "repo-${IDX}: ${GL_LINE} ${BLOB_LINE} ${CHAIN_LINE}"
           fi
           echo "| repo-${IDX} | ${{ matrix.gl }} → ${GL_LINE#GL=} | ${{ matrix.blob }} → ${BLOB_LINE#BLOB=} |" >> "$GITHUB_STEP_SUMMARY"
-          [ "${GL_LINE#GL=}" = "failed" ] && [ -n "$GL_PAT" ] && exit 1
-          [ "${BLOB_LINE#BLOB=}" = "failed" ] && exit 1
+          if [ "${GL_LINE#GL=}" = "failed" ] && [ -n "$GL_PAT" ]; then exit 1; fi
+          if [ "${BLOB_LINE#BLOB=}" = "failed" ]; then exit 1; fi
+          exit 0
 
   report:
     needs: [plan, mirror]
