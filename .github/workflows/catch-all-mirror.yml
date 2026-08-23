@@ -112,7 +112,8 @@ jobs:
               [ "$(echo "$t" | jq 'length')" -lt 100 ] && break
             done
             gh_map=$(echo "$gh_br" | jq -r '[.[] | .name+":"+(.commit.sha // "?")] | sort | join(",")')
-            gh_tmap=$(echo "$gh_tags" | jq -r '[.[].name] | sort | join(",")')
+            # tags compared by name+sha — a re-pointed tag is real drift
+            gh_tmap=$(echo "$gh_tags" | jq -r '[.[] | .name+":"+(.commit.sha // "")] | sort | join(",")')
             defbr=$(echo "$repos" | jq -r --arg s "$slug" '.[] | select(.full_name==$s) | .default_branch // empty')
             defsha=$(echo "$gh_br" | jq -r --arg b "$defbr" '.[] | select(.name==$b) | .commit.sha // empty')
 
@@ -121,9 +122,21 @@ jobs:
               proj_enc=$(echo -n "${GL_NAMESPACE}/${name}" | jq -sRr @uri)
               gl_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -H "PRIVATE-TOKEN: $GL_PAT" "https://gitlab.com/api/v4/projects/$proj_enc")
               if [ "$gl_code" = "200" ]; then
-                gl_br=$(gl_api "projects/$proj_enc/repository/branches?per_page=100" | jq -r '[.[] | .name+":"+.commit.id] | sort | join(",")')
-                gl_tmap=$(gl_api "projects/$proj_enc/repository/tags?per_page=100" | jq -r '[.[].name] | sort | join(",")')
-                if [ "$gh_map" = "$gl_br" ] && [ "$gh_tmap" = "$gl_tmap" ]; then gl="ok"; else gl="drift"; fi
+                gl_br="[]"; gl_tags="[]"
+                for pg in 1 2 3 4 5; do   # paginate GL symmetrically with GH
+                  b=$(gl_api "projects/$proj_enc/repository/branches?per_page=100&page=$pg")
+                  gl_br=$(echo "$gl_br" | jq -c --argjson b "$b" '. + $b')
+                  [ "$(echo "$b" | jq 'length')" -lt 100 ] && break
+                done
+                for pg in 1 2 3 4 5; do
+                  t=$(gl_api "projects/$proj_enc/repository/tags?per_page=100&page=$pg")
+                  gl_tags=$(echo "$gl_tags" | jq -c --argjson t "$t" '. + $t')
+                  [ "$(echo "$t" | jq 'length')" -lt 100 ] && break
+                done
+                gl_map=$(echo "$gl_br" | jq -r '[.[] | .name+":"+.commit.id] | sort | join(",")')
+                # tags compared by name+sha — a re-pointed tag is real drift
+                gl_tmap=$(echo "$gl_tags" | jq -r '[.[] | .name+":"+.commit] | sort | join(",")')
+                if [ "$gh_map" = "$gl_map" ] && [ "$gh_tmap" = "$gl_tmap" ]; then gl="ok"; else gl="drift"; fi
               elif [ "$gl_code" != "404" ]; then
                 gl="drift"
               fi
@@ -140,9 +153,10 @@ jobs:
 
             if [ "${FORCE_FULL}" = "true" ] || { [ "$gl" != "ok" ] && [ "$gl" != "disabled" ]; } || { [ "$blob" != "ok" ] && [ "$blob" != "disabled" ]; }; then
               idx=$((idx+1))
-              matrix=$(echo "$matrix" | jq -c --arg slug "$slug" --arg slug_b64 "$(echo -n "$slug" | base64 -w0)" --arg name "$name" --arg gl "$gl" --arg blob "$blob" \
-                --arg def "$defbr" --arg sha "$defsha" --argjson i "$idx" \
-                '. += [{i:$i, slug_b64:$slug_b64, name:$name, gl:$gl, blob:$blob, default_branch:$def, default_sha:$sha}]')
+              matrix=$(echo "$matrix" | jq -c --arg slug_b64 "$(echo -n "$slug" | base64 -w0)" --arg name_b64 "$(echo -n "$name" | base64 -w0)" \
+                --arg defbr_b64 "$(echo -n "$defbr" | base64 -w0)" --arg gl "$gl" --arg blob "$blob" \
+                --arg sha "$defsha" --argjson i "$idx" \
+                '. += [{i:$i, slug_b64:$slug_b64, name_b64:$name_b64, default_branch_b64:$defbr_b64, gl:$gl, blob:$blob, default_sha:$sha}]')
               count=$((count+1))
             else
               skipped=$((skipped+1))
@@ -192,31 +206,39 @@ jobs:
       - name: Mirror repo-${{ matrix.i }}
         env:
           SLUG_B64: ${{ matrix.slug_b64 }}
+          NAME_B64: ${{ matrix.name_b64 }}
+          DEFBR_B64: ${{ matrix.default_branch_b64 }}
           DEFSHA: ${{ matrix.default_sha }}
           GLSTATE: ${{ matrix.gl }}
           IDX: ${{ matrix.i }}
         run: |
           set -euo pipefail
           SLUG=$(echo "$SLUG_B64" | base64 -d)
+          NAME=$(echo "$NAME_B64" | base64 -d)
+          DEFBR=$(echo "$DEFBR_B64" | base64 -d)
           # expect-sha early-exit is only safe when GL was already verified
           # in-sync by plan (gl=ok). If gl=drift/missing we MUST do the work.
           EXTRA=""
           [ "$GLSTATE" = "ok" ] && EXTRA="--expect-sha $DEFSHA" || true
           OUT=$(bash "$GITHUB_WORKSPACE/kit/scripts/mirror_core.sh" \
-            --source "$SLUG" --gh-pat "$GH_TOKEN" $EXTRA --bundle 2>&1) || true
+            --source "$SLUG" --gh-pat "$GH_TOKEN" --default-branch "$DEFBR" $EXTRA --bundle 2>&1) || true
           GL_LINE=$(echo "$OUT"  | grep -o 'GL=[a-z-]*'  | tail -1 || echo "GL=unknown")
           BLOB_LINE=$(echo "$OUT" | grep -o 'BLOB=[a-z-]*' | tail -1 || echo "BLOB=unknown")
           CHAIN_LINE=$(echo "$OUT" | grep -o 'blob chain: mode=[a-z]*' | tail -1 || true)
-          # public log: indexes only — mask the slug everywhere
-          MASKED=$(echo "$OUT" | sed "s#${SLUG//./\.}#repo-${IDX}#g")
+          # public log: indexes only — mask slug AND bare repo name (git/GL
+          # error messages leak the name without the owner prefix)
+          MASKED=$(echo "$OUT" | sed -e "s#${SLUG//./\.}#repo-${IDX}#g" -e "s#${NAME//./\.}#repo-${IDX}#g")
           if [ "${GL_LINE#GL=}" = "failed" ] || [ "${BLOB_LINE#BLOB=}" = "failed" ]; then
             echo "$MASKED" | tail -20   # failure detail, masked
           else
             echo "repo-${IDX}: ${GL_LINE} ${BLOB_LINE} ${CHAIN_LINE}"
           fi
           echo "| repo-${IDX} | ${{ matrix.gl }} → ${GL_LINE#GL=} | ${{ matrix.blob }} → ${BLOB_LINE#BLOB=} |" >> "$GITHUB_STEP_SUMMARY"
+          # 'unknown' = mirror_core never reported (crash/broken checkout) — a FAILURE
           if [ "${GL_LINE#GL=}" = "failed" ] && [ -n "$GL_PAT" ]; then exit 1; fi
+          if [ "${GL_LINE#GL=}" = "unknown" ]; then exit 1; fi
           if [ "${BLOB_LINE#BLOB=}" = "failed" ]; then exit 1; fi
+          if [ "${BLOB_LINE#BLOB=}" = "unknown" ]; then exit 1; fi
           exit 0
 
   report:
@@ -234,12 +256,14 @@ jobs:
           OWNER="${GITHUB_REPOSITORY_OWNER}"
           META="${META_NAME:-$OWNER}"
           RUN_ID="${GITHUB_RUN_ID}"
-          # aggregate job conclusions (querying the run itself reports
-          # "in_progress" because this report job is part of it)
+          # aggregate job conclusions. Must exclude THIS report job by job NAME
+          # ("report") — its own conclusion is null while it runs, which used to
+          # make every run read "in_progress" forever. Skipped jobs (e.g. the
+          # mirror job when nothing drifted) are healthy, not failures.
           CONCLUSION="$(curl -sS -H "Authorization: token $GH_PAT" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/$RUN_ID/jobs" \
-            | jq -r '[.jobs[] | select(.name | startswith("Record") | not) | .conclusion]
-                     | if (length == 0) then "unknown"
+            | jq -r '[.jobs[] | select(.name != "report") | select(.conclusion != "skipped") | .conclusion]
+                     | if (length == 0) then "success"
                        elif any(. == null) then "in_progress"
                        elif all(. == "success") then "success"
                        else "failure" end')"
@@ -271,5 +295,23 @@ jobs:
               git add status
               git commit -qm "catchall status ${RUN_ID}: ${CONCLUSION}" || true
               git push -q origin HEAD ) || echo "meta status push skipped"
+          fi
+          # 3) alert on failure: a backup system whose only failure mode is a
+          #    JSON file nobody reads is not production-grade — file an issue
+          #    on the private meta repo (re-open the same tracking issue).
+          if [ "$CONCLUSION" = "failure" ]; then
+            TITLE="catch-all mirror FAILURE (tracking issue)"
+            BODY="Latest failing run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID} (${TS})\n\nThis issue is updated automatically on each failing run. Investigate the run log; common causes are listed in catchall-mirror-kit SKILL.md §6."
+            IID=$(curl -sS -H "Authorization: token $GH_PAT" \
+              "https://api.github.com/repos/${OWNER}/${META}/issues?state=open&labels=catchall-failure" \
+              | jq -r '[.[].number][0] // empty')
+            if [ -n "$IID" ]; then
+              curl -sS -o /dev/null -X POST -H "Authorization: token $GH_PAT" \
+                -d "{\"body\": \"${BODY}\"}" "https://api.github.com/repos/${OWNER}/${META}/issues/${IID}/comments"
+            else
+              curl -sS -o /dev/null -X POST -H "Authorization: token $GH_PAT" \
+                -d "{\"title\": \"${TITLE}\", \"body\": \"${BODY}\", \"labels\": [\"catchall-failure\"]}" \
+                "https://api.github.com/repos/${OWNER}/${META}/issues"
+            fi
           fi
           echo "report recorded: ${CONCLUSION}"
