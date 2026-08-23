@@ -285,8 +285,9 @@ jobs:
             git push -q origin HEAD )
 
           # 2) detailed status -> PRIVATE meta repo
-          if curl -sS -o /dev/null -H "Authorization: token $GH_PAT" \
-               "https://api.github.com/repos/${OWNER}/${META}"; then
+          meta_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -H "Authorization: token $GH_PAT" \
+               "https://api.github.com/repos/${OWNER}/${META}")
+          if [ "$meta_code" = "200" ]; then
             git clone -q "https://x-access-token:${GH_PAT}@github.com/${OWNER}/${META}.git" meta
             ( cd meta
               mkdir -p status
