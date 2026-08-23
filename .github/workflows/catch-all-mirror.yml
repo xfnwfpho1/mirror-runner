@@ -194,6 +194,7 @@ jobs:
       NTL_STORE: ${{ vars.NTL_STORE }}
       BLOB_PART_MB: ${{ vars.BLOB_PART_MB || '256' }}
       BLOB_MAX_MB: ${{ vars.BLOB_MAX_MB || '2000' }}
+      FORCE_FULL: ${{ inputs.force_full }}
       MIRROR_VIA: catchall-public
     steps:
       - name: Checkout kit (private)
@@ -219,7 +220,11 @@ jobs:
           # expect-sha early-exit is only safe when GL was already verified
           # in-sync by plan (gl=ok). If gl=drift/missing we MUST do the work.
           EXTRA=""
-          if [ "$GLSTATE" = "ok" ] && [ -n "$DEFSHA" ]; then EXTRA="--expect-sha $DEFSHA"; fi
+          # force_full demands a REAL re-mirror even when in sync (paranoid
+          # recovery) — the sha spot-check early exit must not neuter it
+          if [ "$FORCE_FULL" != "true" ] && [ "$GLSTATE" = "ok" ] && [ -n "$DEFSHA" ]; then
+            EXTRA="--expect-sha $DEFSHA"
+          fi
           OUT=$(bash "$GITHUB_WORKSPACE/kit/scripts/mirror_core.sh" \
             --source "$SLUG" --gh-pat "$GH_TOKEN" --default-branch "$DEFBR" $EXTRA --bundle 2>&1) || true
           GL_LINE=$(echo "$OUT"  | grep -o 'GL=[a-z-]*'  | tail -1 || echo "GL=unknown")
@@ -260,9 +265,15 @@ jobs:
           # ("report") — its own conclusion is null while it runs, which used to
           # make every run read "in_progress" forever. Skipped jobs (e.g. the
           # mirror job when nothing drifted) are healthy, not failures.
-          CONCLUSION="$(curl -sS -H "Authorization: token $GH_PAT" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/$RUN_ID/jobs?per_page=100" \
-            | jq -r '[.jobs[] | select(.name != "report") | select(.conclusion != "skipped") | .conclusion]
+          _JOBS=""
+          for _jp in 1 2 3 4 5 6 7 8 9 10; do
+            _PAGE=$(curl -sS -H "Authorization: token $GH_PAT" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/$RUN_ID/jobs?per_page=100&page=$_jp")
+            _N=$(echo "$_PAGE" | jq '.jobs | length')
+            _JOBS="$_JOBS$_PAGE"
+            if [ -z "$_N" ] || [ "$_N" -lt 100 ]; then break; fi
+          done
+          CONCLUSION="$(echo "$_JOBS" | jq -s -r '[.[].jobs[]? | select(.name != "report") | select(.conclusion != "skipped") | .conclusion]
                      | if (length == 0) then "success"
                        elif any(. == null) then "in_progress"
                        elif all(. == "success") then "success"
@@ -282,12 +293,14 @@ jobs:
               "https://api.github.com/repos/${OWNER}/${META}/issues?state=open&labels=catchall-failure" \
               | jq -r '[.[].number][0] // empty')
             if [ -n "$IID" ]; then
-              curl -sS -o /dev/null -X POST -H "Authorization: token $GH_PAT" \
-                -d "{\"body\": \"${BODY}\"}" "https://api.github.com/repos/${OWNER}/${META}/issues/${IID}/comments"
+              curl -sS -o /dev/null -f -X POST -H "Authorization: token $GH_PAT" \
+                -d "{\"body\": \"${BODY}\"}" "https://api.github.com/repos/${OWNER}/${META}/issues/${IID}/comments" \
+                || echo "::warning::alert comment failed (issues disabled?)"
             else
-              curl -sS -o /dev/null -X POST -H "Authorization: token $GH_PAT" \
+              curl -sS -o /dev/null -f -X POST -H "Authorization: token $GH_PAT" \
                 -d "{\"title\": \"${TITLE}\", \"body\": \"${BODY}\", \"labels\": [\"catchall-failure\"]}" \
-                "https://api.github.com/repos/${OWNER}/${META}/issues"
+                "https://api.github.com/repos/${OWNER}/${META}/issues" \
+                || echo "::warning::alert issue creation failed (issues disabled?)"
             fi
           fi
           # 2) marker commit HERE (public repo): keeps repo active so the
