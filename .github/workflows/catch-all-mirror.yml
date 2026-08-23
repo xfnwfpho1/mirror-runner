@@ -1,0 +1,265 @@
+name: Catch-all mirror (all repos)
+
+# PUBLIC-REPO RUNNER: GitHub Actions on public repos is FREE (unlimited
+# standard-runner minutes), so this repo carries the schedule while the kit,
+# docs and detailed status live in PRIVATE repos.
+#
+# Public-safety rules baked in — do NOT weaken them:
+#   * Secrets (GH_PAT / GL_PAT / NTL_TOKEN) live ONLY in this repo's Actions
+#     secret store; they are encrypted at rest and auto-masked in logs.
+#   * Only `schedule` and `workflow_dispatch` triggers. NEVER add
+#     `pull_request_target` (fork PRs would get secret access).
+#   * Job names, step names, summaries and echoed logs must NOT contain
+#     private repo names: matrix uses indexes (repo-1, repo-2...), mirror_core
+#     output is captured and masked before printing.
+#   * Detailed per-run status is committed to the PRIVATE meta repo
+#     (status/latest.json) — the public summary carries counts only.
+#   * The report job commits a .last-run marker HERE after every run — this
+#     also keeps the repo "active" so GitHub's 60-day scheduled-workflow
+#     auto-disable rule never trips.
+#
+# Secrets: GH_PAT (repo scope), GL_PAT (optional), NTL_TOKEN (optional)
+# Vars   : GL_NAMESPACE, NTL_SITE_ID, NTL_STORE, KIT_REPO (private kit repo,
+#          default catchall-mirror-kit), MIRROR_EXCLUDE (optional),
+#          BLOB_PART_MB (default 256), BLOB_MAX_MB (default 2000), META_NAME
+#          (private meta repo, default = owner name)
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_full:
+        description: 'Mirror every repo even if drift check says in sync'
+        type: boolean
+        default: false
+
+concurrency:
+  group: catch-all-mirror
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      total: ${{ steps.plan.outputs.total }}
+      skipped: ${{ steps.plan.outputs.skipped }}
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+      GL_PAT: ${{ secrets.GL_PAT }}
+      GL_NAMESPACE: ${{ vars.GL_NAMESPACE }}
+      MIRROR_EXCLUDE: ${{ vars.MIRROR_EXCLUDE }}
+      NTL_TOKEN: ${{ secrets.NTL_TOKEN }}
+      NTL_SITE: ${{ vars.NTL_SITE_ID }}
+      NTL_STORE: ${{ vars.NTL_STORE }}
+      FORCE_FULL: ${{ inputs.force_full }}
+    steps:
+      - name: Preflight tokens
+        run: |
+          set -euo pipefail
+          gh_login=$(curl -sS --max-time 30 -H "Authorization: token $GH_PAT" https://api.github.com/user | jq -r '.login // empty')
+          [ -n "$gh_login" ] || { echo "::error::GH_PAT invalid"; exit 1; }
+          if [ -n "$GL_PAT" ]; then
+            for i in 1 2 3; do
+              gl_user=$(curl -sS --max-time 30 -H "PRIVATE-TOKEN: $GL_PAT" https://gitlab.com/api/v4/user | jq -r '.username // empty')
+              [ -n "$gl_user" ] && break; sleep 2
+            done
+            [ -n "$gl_user" ] || { echo "::error::GL_PAT set but invalid"; exit 1; }
+            [ -n "$GL_NAMESPACE" ] || { echo "::error::GL_PAT set but GL_NAMESPACE var missing"; exit 1; }
+          fi
+          echo "preflight ok"
+
+      - name: Plan (drift detection across all repos)
+        id: plan
+        run: |
+          set -euo pipefail
+          gh_api() { curl -sS --max-time 30 -H "Authorization: token $GH_PAT" "https://api.github.com/$1"; }
+          gl_api() { curl -sS --max-time 30 -H "PRIVATE-TOKEN: $GL_PAT" "https://gitlab.com/api/v4/$1"; }
+
+          repos="[]"
+          for p in $(seq 1 10); do
+            page=$(gh_api "user/repos?per_page=100&page=$p&type=owner")
+            repos=$(echo "$repos" | jq -c --argjson pg "$page" '. + $pg')
+            [ "$(echo "$page" | jq 'length')" -lt 100 ] && break
+          done
+          total=$(echo "$repos" | jq 'length')
+
+          matrix="[]"; count=0; skipped=0; empty=0; idx=0
+          for slug in $(echo "$repos" | jq -r '.[] | select(.archived==false) | .full_name'); do
+            name="${slug#*/}"
+            if [[ ",${MIRROR_EXCLUDE}," == *",${name},"* || ",${MIRROR_EXCLUDE}," == *",${slug},"* ]]; then
+              skipped=$((skipped+1)); continue
+            fi
+
+            gh_br="[]"; gh_tags="[]"
+            for pg in 1 2 3 4 5; do
+              b=$(gh_api "repos/$slug/branches?per_page=100&page=$pg")
+              gh_br=$(echo "$gh_br" | jq -c --argjson b "$b" '. + $b')
+              [ "$(echo "$b" | jq 'length')" -lt 100 ] && break
+            done
+            if [ "$(echo "$gh_br" | jq 'length')" -eq 0 ]; then
+              empty=$((empty+1)); continue
+            fi
+            for pg in 1 2 3 4 5; do
+              t=$(gh_api "repos/$slug/tags?per_page=100&page=$pg")
+              gh_tags=$(echo "$gh_tags" | jq -c --argjson t "$t" '. + $t')
+              [ "$(echo "$t" | jq 'length')" -lt 100 ] && break
+            done
+            gh_map=$(echo "$gh_br" | jq -r '[.[] | .name+":"+(.commit.sha // "?")] | sort | join(",")')
+            gh_tmap=$(echo "$gh_tags" | jq -r '[.[].name] | sort | join(",")')
+            defbr=$(echo "$repos" | jq -r --arg s "$slug" '.[] | select(.full_name==$s) | .default_branch // empty')
+            defsha=$(echo "$gh_br" | jq -r --arg b "$defbr" '.[] | select(.name==$b) | .commit.sha // empty')
+
+            gl="missing"
+            if [ -n "$GL_PAT" ]; then
+              proj_enc=$(echo -n "${GL_NAMESPACE}/${name}" | jq -sRr @uri)
+              gl_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -H "PRIVATE-TOKEN: $GL_PAT" "https://gitlab.com/api/v4/projects/$proj_enc")
+              if [ "$gl_code" = "200" ]; then
+                gl_br=$(gl_api "projects/$proj_enc/repository/branches?per_page=100" | jq -r '[.[] | .name+":"+.commit.id] | sort | join(",")')
+                gl_tmap=$(gl_api "projects/$proj_enc/repository/tags?per_page=100" | jq -r '[.[].name] | sort | join(",")')
+                if [ "$gh_map" = "$gl_br" ] && [ "$gh_tmap" = "$gl_tmap" ]; then gl="ok"; else gl="drift"; fi
+              elif [ "$gl_code" != "404" ]; then
+                gl="drift"
+              fi
+            fi
+
+            blob="disabled"
+            if [ -n "${NTL_TOKEN:-}" ] && [ -n "${NTL_SITE:-}" ] && [ -n "${NTL_STORE:-}" ]; then
+              blob="stale"
+              latest=$(curl -s --max-time 20 -H "Authorization: Bearer $NTL_TOKEN" \
+                "https://api.netlify.com/api/v1/blobs/$NTL_SITE/$NTL_STORE/mirrors/${slug}/LATEST.json" 2>/dev/null || true)
+              b_sha=$(echo "$latest" 2>/dev/null | jq -r '.sha // empty' 2>/dev/null || true)
+              if [ -n "$b_sha" ] && [ -n "$defsha" ] && [ "$b_sha" = "$defsha" ]; then blob="ok"; fi
+            fi
+
+            if [ "${FORCE_FULL}" = "true" ] || { [ "$gl" != "ok" ] && [ "$gl" != "disabled" ]; } || { [ "$blob" != "ok" ] && [ "$blob" != "disabled" ]; }; then
+              idx=$((idx+1))
+              matrix=$(echo "$matrix" | jq -c --arg slug "$slug" --arg name "$name" --arg gl "$gl" --arg blob "$blob" \
+                --arg def "$defbr" --arg sha "$defsha" --argjson i "$idx" \
+                '. += [{i:$i, slug:$slug, name:$name, gl:$gl, blob:$blob, default_branch:$def, default_sha:$sha}]')
+              count=$((count+1))
+            else
+              skipped=$((skipped+1))
+            fi
+          done
+
+          echo "matrix=$(echo "$matrix" | jq -c '{include: .}')" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "skipped=$((skipped+empty))" >> "$GITHUB_OUTPUT"
+          # public summary: COUNTS ONLY (no repo names)
+          {
+            echo "## Catch-all mirror plan"
+            echo ""
+            echo "- repos: **$total** total — **$((skipped+empty))** in sync/skipped/empty, **$count** need attention"
+            echo "- mode: GL=$([ -n "$GL_PAT" ] && echo enabled || echo OFF), blobs=$([ -n "$NTL_TOKEN" ] && echo enabled || echo OFF)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  mirror:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      GL_PAT: ${{ secrets.GL_PAT }}
+      GL_NAMESPACE: ${{ vars.GL_NAMESPACE }}
+      NTL_TOKEN: ${{ secrets.NTL_TOKEN }}
+      NTL_SITE_ID: ${{ vars.NTL_SITE_ID }}
+      NTL_STORE: ${{ vars.NTL_STORE }}
+      BLOB_PART_MB: ${{ vars.BLOB_PART_MB || '256' }}
+      BLOB_MAX_MB: ${{ vars.BLOB_MAX_MB || '2000' }}
+      MIRROR_VIA: catchall-public
+    steps:
+      - name: Checkout kit (private)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ vars.KIT_REPO || 'catchall-mirror-kit' }}
+          token: ${{ secrets.GH_PAT }}
+          path: kit
+
+      - name: Mirror repo-${{ matrix.i }}
+        env:
+          SLUG: ${{ matrix.slug }}
+          DEFSHA: ${{ matrix.default_sha }}
+          GLSTATE: ${{ matrix.gl }}
+          IDX: ${{ matrix.i }}
+        run: |
+          set -euo pipefail
+          # expect-sha early-exit is only safe when GL was already verified
+          # in-sync by plan (gl=ok). If gl=drift/missing we MUST do the work.
+          EXTRA=""
+          [ "$GLSTATE" = "ok" ] && EXTRA="--expect-sha $DEFSHA"
+          OUT=$(bash "$GITHUB_WORKSPACE/kit/scripts/mirror_core.sh" \
+            --source "$SLUG" --gh-pat "$GH_TOKEN" $EXTRA --bundle 2>&1) || true
+          GL_LINE=$(echo "$OUT"  | grep -o 'GL=[a-z-]*'  | tail -1 || echo "GL=unknown")
+          BLOB_LINE=$(echo "$OUT" | grep -o 'BLOB=[a-z-]*' | tail -1 || echo "BLOB=unknown")
+          CHAIN_LINE=$(echo "$OUT" | grep -o 'blob chain: mode=[a-z]*' | tail -1 || true)
+          # public log: indexes only — mask the slug everywhere
+          MASKED=$(echo "$OUT" | sed "s#${SLUG//./\\.}#repo-${IDX}#g")
+          if [ "${GL_LINE#GL=}" = "failed" ] || [ "${BLOB_LINE#BLOB=}" = "failed" ]; then
+            echo "$MASKED" | tail -20   # failure detail, masked
+          else
+            echo "repo-${IDX}: ${GL_LINE} ${BLOB_LINE} ${CHAIN_LINE}"
+          fi
+          echo "| repo-${IDX} | ${{ matrix.gl }} → ${GL_LINE#GL=} | ${{ matrix.blob }} → ${BLOB_LINE#BLOB=} |" >> "$GITHUB_STEP_SUMMARY"
+          [ "${GL_LINE#GL=}" = "failed" ] && [ -n "$GL_PAT" ] && exit 1
+          [ "${BLOB_LINE#BLOB=}" = "failed" ] && exit 1
+
+  report:
+    needs: [plan, mirror]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+      META_NAME: ${{ vars.META_NAME }}
+    steps:
+      - name: Record run status (private meta repo + activity marker here)
+        run: |
+          set -euo pipefail
+          OWNER="${GITHUB_REPOSITORY_OWNER}"
+          META="${META_NAME:-$OWNER}"
+          RUN_ID="${GITHUB_RUN_ID}"
+          CONCLUSION="$(curl -sS -H "Authorization: token $GH_PAT" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/$RUN_ID" \
+            | jq -r '.conclusion // .status')"
+          TS=$(date -u +%FT%TZ)
+          STATUS=$(printf '{"ts":"%s","run_id":"%s","url":"https://github.com/%s/actions/runs/%s","conclusion":"%s","repos_total":"%s","need_attention":"%s","in_sync":"%s"}\n' \
+            "$TS" "$RUN_ID" "$GITHUB_REPOSITORY" "$RUN_ID" "$CONCLUSION" \
+            "${{ needs.plan.outputs.total }}" "${{ needs.plan.outputs.count }}" "${{ needs.plan.outputs.skipped }}")
+
+          # 1) marker commit HERE (public repo): keeps repo active so the
+          #    60-day scheduled-workflow auto-disable never triggers
+          git config --global user.name "mirror-runner" user.email "runner@users.noreply.github.com" --replace-all
+          git config --global init.defaultBranch main
+          git clone -q "https://x-access-token:${GH_PAT}@github.com/${GITHUB_REPOSITORY}.git" self
+          ( cd self
+            echo "$STATUS" > .last-run
+            git add .last-run
+            git commit -qm "run status ${RUN_ID}: ${CONCLUSION}" || true
+            git push -q origin HEAD )
+
+          # 2) detailed status -> PRIVATE meta repo
+          if curl -sS -o /dev/null -H "Authorization: token $GH_PAT" \
+               "https://api.github.com/repos/${OWNER}/${META}"; then
+            git clone -q "https://x-access-token:${GH_PAT}@github.com/${OWNER}/${META}.git" meta
+            ( cd meta
+              mkdir -p status
+              echo "$STATUS" > status/latest.json
+              echo "$STATUS" >> status/history.jsonl
+              git add status
+              git commit -qm "catchall status ${RUN_ID}: ${CONCLUSION}" || true
+              git push -q origin HEAD ) || echo "meta status push skipped"
+          fi
+          echo "report recorded: ${CONCLUSION}"
