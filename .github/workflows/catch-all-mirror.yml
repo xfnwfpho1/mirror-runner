@@ -135,7 +135,7 @@ jobs:
                 done
                 gl_map=$(echo "$gl_br" | jq -r '[.[] | .name+":"+.commit.id] | sort | join(",")')
                 # tags compared by name+sha — a re-pointed tag is real drift
-                gl_tmap=$(echo "$gl_tags" | jq -r '[.[] | .name+":"+.commit] | sort | join(",")')
+                gl_tmap=$(echo "$gl_tags" | jq -r '[.[] | .name+":"+(.commit.id // "")] | sort | join(",")')
                 if [ "$gh_map" = "$gl_map" ] && [ "$gh_tmap" = "$gl_tmap" ]; then gl="ok"; else gl="drift"; fi
               elif [ "$gl_code" != "404" ]; then
                 gl="drift"
@@ -219,7 +219,7 @@ jobs:
           # expect-sha early-exit is only safe when GL was already verified
           # in-sync by plan (gl=ok). If gl=drift/missing we MUST do the work.
           EXTRA=""
-          [ "$GLSTATE" = "ok" ] && EXTRA="--expect-sha $DEFSHA" || true
+          if [ "$GLSTATE" = "ok" ] && [ -n "$DEFSHA" ]; then EXTRA="--expect-sha $DEFSHA"; fi
           OUT=$(bash "$GITHUB_WORKSPACE/kit/scripts/mirror_core.sh" \
             --source "$SLUG" --gh-pat "$GH_TOKEN" --default-branch "$DEFBR" $EXTRA --bundle 2>&1) || true
           GL_LINE=$(echo "$OUT"  | grep -o 'GL=[a-z-]*'  | tail -1 || echo "GL=unknown")
@@ -261,7 +261,7 @@ jobs:
           # make every run read "in_progress" forever. Skipped jobs (e.g. the
           # mirror job when nothing drifted) are healthy, not failures.
           CONCLUSION="$(curl -sS -H "Authorization: token $GH_PAT" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/$RUN_ID/jobs" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/$RUN_ID/jobs?per_page=100" \
             | jq -r '[.jobs[] | select(.name != "report") | select(.conclusion != "skipped") | .conclusion]
                      | if (length == 0) then "success"
                        elif any(. == null) then "in_progress"
@@ -272,34 +272,9 @@ jobs:
             "$TS" "$RUN_ID" "$GITHUB_REPOSITORY" "$RUN_ID" "$CONCLUSION" \
             "${{ needs.plan.outputs.total }}" "${{ needs.plan.outputs.count }}" "${{ needs.plan.outputs.skipped }}")
 
-          # 1) marker commit HERE (public repo): keeps repo active so the
-          #    60-day scheduled-workflow auto-disable never triggers
-          git config --global user.name "mirror-runner"
-          git config --global user.email "runner@users.noreply.github.com"
-          git config --global init.defaultBranch main
-          git clone -q "https://x-access-token:${GH_PAT}@github.com/${GITHUB_REPOSITORY}.git" self
-          ( cd self
-            echo "$STATUS" > .last-run
-            git add .last-run
-            git commit -qm "run status ${RUN_ID}: ${CONCLUSION}" || true
-            git push -q origin HEAD )
-
-          # 2) detailed status -> PRIVATE meta repo
-          meta_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -H "Authorization: token $GH_PAT" \
-               "https://api.github.com/repos/${OWNER}/${META}")
-          if [ "$meta_code" = "200" ]; then
-            git clone -q "https://x-access-token:${GH_PAT}@github.com/${OWNER}/${META}.git" meta
-            ( cd meta
-              mkdir -p status
-              echo "$STATUS" > status/latest.json
-              echo "$STATUS" >> status/history.jsonl
-              git add status
-              git commit -qm "catchall status ${RUN_ID}: ${CONCLUSION}" || true
-              git push -q origin HEAD ) || echo "meta status push skipped"
-          fi
-          # 3) alert on failure: a backup system whose only failure mode is a
-          #    JSON file nobody reads is not production-grade — file an issue
-          #    on the private meta repo (re-open the same tracking issue).
+          # 1) alert on failure (BEFORE the pushes: a rejected a backup system whose only failure mode is a
+          #    push below must never swallow the alert) — file an issue on the
+          #    private meta repo (re-open the same tracking issue).
           if [ "$CONCLUSION" = "failure" ]; then
             TITLE="catch-all mirror FAILURE (tracking issue)"
             BODY="Latest failing run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID} (${TS})\n\nThis issue is updated automatically on each failing run. Investigate the run log; common causes are listed in catchall-mirror-kit SKILL.md §6."
@@ -314,5 +289,30 @@ jobs:
                 -d "{\"title\": \"${TITLE}\", \"body\": \"${BODY}\", \"labels\": [\"catchall-failure\"]}" \
                 "https://api.github.com/repos/${OWNER}/${META}/issues"
             fi
+          fi
+          # 2) marker commit HERE (public repo): keeps repo active so the
+          #    60-day scheduled-workflow auto-disable never triggers
+          git config --global user.name "mirror-runner"
+          git config --global user.email "runner@users.noreply.github.com"
+          git config --global init.defaultBranch main
+          git clone -q "https://x-access-token:${GH_PAT}@github.com/${GITHUB_REPOSITORY}.git" self
+          ( cd self
+            echo "$STATUS" > .last-run
+            git add .last-run
+            git commit -qm "run status ${RUN_ID}: ${CONCLUSION}" || true
+            git push -q origin HEAD )
+
+          # 3) detailed status -> PRIVATE meta repo
+          meta_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -H "Authorization: token $GH_PAT" \
+               "https://api.github.com/repos/${OWNER}/${META}")
+          if [ "$meta_code" = "200" ]; then
+            git clone -q "https://x-access-token:${GH_PAT}@github.com/${OWNER}/${META}.git" meta
+            ( cd meta
+              mkdir -p status
+              echo "$STATUS" > status/latest.json
+              echo "$STATUS" >> status/history.jsonl
+              git add status
+              git commit -qm "catchall status ${RUN_ID}: ${CONCLUSION}" || true
+              git push -q origin HEAD ) || echo "meta status push skipped"
           fi
           echo "report recorded: ${CONCLUSION}"
