@@ -18,11 +18,18 @@ name: Catch-all mirror (all repos)
 #     also keeps the repo "active" so GitHub's 60-day scheduled-workflow
 #     auto-disable rule never trips.
 #
-# Secrets: GH_PAT (repo scope), GL_PAT (optional), NTL_TOKEN (optional)
-# Vars   : GL_NAMESPACE, NTL_SITE_ID, NTL_STORE, KIT_REPO (private kit repo,
+# Secrets: GH_PAT (repo scope), GL_PAT (optional), GL2_PAT / GH2_PAT /
+#          BB_PAT / GENERIC_PAT (optional extra target token slots)
+# Vars   : TARGETS (optional JSON array — multi-target, see targets_lib.sh;
+#          e.g. [{"kind":"gitlab","ns":"central-user"},
+#                {"kind":"gitlab","ns":"group/per-account","pat":"GL2_PAT"}]
+#          tokens are referenced BY SECRET NAME, never stored in the var),
+#          GL_NAMESPACE, NTL_SITE_ID, NTL_STORE, KIT_REPO (private kit repo,
 #          default catchall-mirror-kit), MIRROR_EXCLUDE (optional),
 #          BLOB_PART_MB (default 256), BLOB_MAX_MB (default 2000), META_NAME
-#          (private meta repo, default = owner name)
+#          (private meta repo, default = owner name).
+#          With TARGETS unset, the legacy single GitLab target
+#          (GL_PAT + GL_NAMESPACE) applies — identical to previous behavior.
 
 on:
   schedule:
@@ -58,20 +65,49 @@ jobs:
       NTL_TOKEN: ${{ secrets.NTL_TOKEN }}
       NTL_SITE: ${{ vars.NTL_SITE_ID }}
       NTL_STORE: ${{ vars.NTL_STORE }}
+      TARGETS: ${{ vars.TARGETS }}
+      GL2_PAT: ${{ secrets.GL2_PAT }}
+      GH2_PAT: ${{ secrets.GH2_PAT }}
+      BB_PAT: ${{ secrets.BB_PAT }}
+      GENERIC_PAT: ${{ secrets.GENERIC_PAT }}
       FORCE_FULL: ${{ inputs.force_full }}
     steps:
+      - name: Checkout kit (private)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ vars.KIT_REPO || 'catchall-mirror-kit' }}
+          token: ${{ secrets.GH_PAT }}
+          path: kit
+
       - name: Preflight tokens
         run: |
           set -euo pipefail
           gh_login=$(curl -sS --max-time 30 -H "Authorization: token $GH_PAT" https://api.github.com/user | jq -r '.login // empty')
           [ -n "$gh_login" ] || { echo "::error::GH_PAT invalid"; exit 1; }
-          if [ -n "$GL_PAT" ]; then
+          if [ -n "$GL_PAT" ] && [ -z "${TARGETS:-}" ]; then
             for i in 1 2 3; do
               gl_user=$(curl -sS --max-time 30 -H "PRIVATE-TOKEN: $GL_PAT" https://gitlab.com/api/v4/user | jq -r '.username // empty')
               [ -n "$gl_user" ] && break; sleep 2
             done
             [ -n "$gl_user" ] || { echo "::error::GL_PAT set but invalid"; exit 1; }
             [ -n "$GL_NAMESPACE" ] || { echo "::error::GL_PAT set but GL_NAMESPACE var missing"; exit 1; }
+          fi
+          # multi-target: every token slot referenced by TARGETS must be filled
+          if [ -n "${TARGETS:-}" ]; then
+            while IFS= read -r slot; do
+              [ -n "$slot" ] || continue
+              if [ -z "${!slot:-}" ]; then
+                echo "::error::TARGETS references token slot '$slot' but the matching repo secret is unset"
+                exit 1
+              fi
+            done < <(echo "$TARGETS" | jq -r '.[] | select(type=="object") | .pat // empty' 2>/dev/null)
+            while IFS= read -r dslot; do
+              [ -n "$dslot" ] || continue
+              if [ -z "${!dslot:-}" ]; then
+                echo "::error::TARGETS entry references default token slot '$dslot' but the matching repo secret is unset (set it, or name an explicit \"pat\")"
+                exit 1
+              fi
+            done < <(echo "$TARGETS" | jq -r '.[] | select(type=="object") | select(.pat == null) | (.kind // "gitlab") | {gitlab:"GL_PAT",github:"GH2_PAT",bitbucket:"BB_PAT",generic:"GENERIC_PAT"}[.] // empty' 2>/dev/null)
           fi
           echo "preflight ok"
 
@@ -80,7 +116,6 @@ jobs:
         run: |
           set -euo pipefail
           gh_api() { curl -sS --max-time 30 -H "Authorization: token $GH_PAT" "https://api.github.com/$1"; }
-          gl_api() { curl -sS --max-time 30 -H "PRIVATE-TOKEN: $GL_PAT" "https://gitlab.com/api/v4/$1"; }
 
           repos="[]"
           for p in $(seq 1 10); do
@@ -90,6 +125,16 @@ jobs:
           done
           total=$(echo "$repos" | jq 'length')
 
+          # target resolution is SHARED with mirror_core (one parser, vendored
+          # in the kit) — legacy GL_PAT/GL_NAMESPACE applies when TARGETS unset
+          . "$GITHUB_WORKSPACE/kit/scripts/targets_lib.sh"
+          RESOLVED_TARGETS="$(targets_resolve)"
+
+          refmap_of() {  # ls-remote filter: heads+tags only, no peeled ^{} lines
+            git ls-remote "$1" 2>/dev/null \
+              | awk '$2 ~ /^refs\/(heads|tags)\// && $2 !~ /\^\{\}$/ {print $2":"$1}' | sort
+          }
+
           matrix="[]"; count=0; skipped=0; empty=0; idx=0
           for slug in $(echo "$repos" | jq -r '.[] | select(.archived==false) | .full_name'); do
             name="${slug#*/}"
@@ -97,7 +142,7 @@ jobs:
               skipped=$((skipped+1)); continue
             fi
 
-            gh_br="[]"; gh_tags="[]"
+            gh_br="[]"
             for pg in 1 2 3 4 5; do
               b=$(gh_api "repos/$slug/branches?per_page=100&page=$pg")
               gh_br=$(echo "$gh_br" | jq -c --argjson b "$b" '. + $b')
@@ -106,41 +151,32 @@ jobs:
             if [ "$(echo "$gh_br" | jq 'length')" -eq 0 ]; then
               empty=$((empty+1)); continue
             fi
-            for pg in 1 2 3 4 5; do
-              t=$(gh_api "repos/$slug/tags?per_page=100&page=$pg")
-              gh_tags=$(echo "$gh_tags" | jq -c --argjson t "$t" '. + $t')
-              [ "$(echo "$t" | jq 'length')" -lt 100 ] && break
-            done
-            gh_map=$(echo "$gh_br" | jq -r '[.[] | .name+":"+(.commit.sha // "?")] | sort | join(",")')
-            # tags compared by name+sha — a re-pointed tag is real drift
-            gh_tmap=$(echo "$gh_tags" | jq -r '[.[] | .name+":"+(.commit.sha // "")] | sort | join(",")')
             defbr=$(echo "$repos" | jq -r --arg s "$slug" '.[] | select(.full_name==$s) | .default_branch // empty')
             defsha=$(echo "$gh_br" | jq -r --arg b "$defbr" '.[] | select(.name==$b) | .commit.sha // empty')
 
-            gl="disabled"   # blob-only mode: never flag as needing GL repair
-            if [ -n "$GL_PAT" ]; then
-              gl="missing"
-              proj_enc=$(echo -n "${GL_NAMESPACE}/${name}" | jq -sRr @uri)
-              gl_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -H "PRIVATE-TOKEN: $GL_PAT" "https://gitlab.com/api/v4/projects/$proj_enc")
-              if [ "$gl_code" = "200" ]; then
-                gl_br="[]"; gl_tags="[]"
-                for pg in 1 2 3 4 5; do   # paginate GL symmetrically with GH
-                  b=$(gl_api "projects/$proj_enc/repository/branches?per_page=100&page=$pg")
-                  gl_br=$(echo "$gl_br" | jq -c --argjson b "$b" '. + $b')
-                  [ "$(echo "$b" | jq 'length')" -lt 100 ] && break
-                done
-                for pg in 1 2 3 4 5; do
-                  t=$(gl_api "projects/$proj_enc/repository/tags?per_page=100&page=$pg")
-                  gl_tags=$(echo "$gl_tags" | jq -c --argjson t "$t" '. + $t')
-                  [ "$(echo "$t" | jq 'length')" -lt 100 ] && break
-                done
-                gl_map=$(echo "$gl_br" | jq -r '[.[] | .name+":"+.commit.id] | sort | join(",")')
-                # tags compared by name+sha — a re-pointed tag is real drift
-                gl_tmap=$(echo "$gl_tags" | jq -r '[.[] | .name+":"+(.commit.id // "")] | sort | join(",")')
-                if [ "$gh_map" = "$gl_map" ] && [ "$gh_tmap" = "$gl_tmap" ]; then gl="ok"; else gl="drift"; fi
-              elif [ "$gl_code" != "404" ]; then
-                gl="drift"
-              fi
+            # source refmap straight from GitHub's info/refs: one call, no
+            # pagination cap, and sha semantics IDENTICAL to the target-side
+            # ls-remote (annotated tags compare as tag-object shas on both
+            # sides; the old API-vs-API compare peeled differently per side)
+            gh_map=""
+            for i in 1 2 3; do
+              gh_map=$(refmap_of "https://x-access-token:${GH_PAT}@github.com/${slug}.git")
+              [ -n "$gh_map" ] && break; sleep 3
+            done
+            # ls-remote unusable while the API saw branches -> force repair
+            # (loud drift), never silently hide a repo
+            [ -n "$gh_map" ] || gh_map="__UNREACHABLE__"
+
+            gl="disabled"   # no targets configured: never flag as needing repair
+            if [ -n "$RESOLVED_TARGETS" ]; then
+              gl="ok"
+              while IFS= read -r SPEC; do
+                [ -n "$SPEC" ] || continue
+                t_map=$(refmap_of "$(target_remote "$SPEC" "$name")")
+                if [ -z "$t_map" ] || [ "$t_map" != "$gh_map" ]; then
+                  gl="drift"; break
+                fi
+              done <<< "$RESOLVED_TARGETS"
             fi
 
             blob="disabled"
@@ -173,7 +209,7 @@ jobs:
             echo "## Catch-all mirror plan"
             echo ""
             echo "- repos: **$total** total — **$((skipped+empty))** in sync/skipped/empty, **$count** need attention"
-            echo "- mode: GL=$([ -n "$GL_PAT" ] && echo enabled || echo OFF), blobs=$([ -n "$NTL_TOKEN" ] && echo enabled || echo OFF)"
+            echo "- mode: targets=$([ -n "$RESOLVED_TARGETS" ] && echo "$(echo "$RESOLVED_TARGETS" | grep -c . || true)" || echo OFF), blobs=$([ -n "$NTL_TOKEN" ] && echo enabled || echo OFF)"
           } >> "$GITHUB_STEP_SUMMARY"
 
   mirror:
@@ -190,6 +226,11 @@ jobs:
       GH_TOKEN: ${{ secrets.GH_PAT }}
       GL_PAT: ${{ secrets.GL_PAT }}
       GL_NAMESPACE: ${{ vars.GL_NAMESPACE }}
+      TARGETS: ${{ vars.TARGETS }}
+      GL2_PAT: ${{ secrets.GL2_PAT }}
+      GH2_PAT: ${{ secrets.GH2_PAT }}
+      BB_PAT: ${{ secrets.BB_PAT }}
+      GENERIC_PAT: ${{ secrets.GENERIC_PAT }}
       NTL_TOKEN: ${{ secrets.NTL_TOKEN }}
       NTL_SITE_ID: ${{ vars.NTL_SITE_ID }}
       NTL_STORE: ${{ vars.NTL_STORE }}
@@ -218,8 +259,8 @@ jobs:
           SLUG=$(echo "$SLUG_B64" | base64 -d)
           NAME=$(echo "$NAME_B64" | base64 -d)
           DEFBR=$(echo "$DEFBR_B64" | base64 -d)
-          # expect-sha early-exit is only safe when GL was already verified
-          # in-sync by plan (gl=ok). If gl=drift/missing we MUST do the work.
+          # expect-sha early-exit is only safe when every target was already
+          # verified in-sync by plan (gl=ok). If gl=drift we MUST do the work.
           EXTRA=""
           # force_full demands a REAL re-mirror even when in sync (paranoid
           # recovery) — the sha spot-check early exit must not neuter it
@@ -232,8 +273,13 @@ jobs:
           BLOB_LINE=$(echo "$OUT" | grep -o 'BLOB=[a-z-]*' | tail -1 || echo "BLOB=unknown")
           CHAIN_LINE=$(echo "$OUT" | grep -o 'blob chain: mode=[a-z]*' | tail -1 || true)
           # public log: indexes only — mask slug AND bare repo name (git/GL
-          # error messages leak the name without the owner prefix)
+          # error messages leak the name without the owner prefix), plus every
+          # target namespace (multi-target labels would leak them otherwise)
           MASKED=$(echo "$OUT" | sed -e "s#${SLUG//./\.}#repo-${IDX}#g" -e "s#${NAME//./\.}#repo-${IDX}#g")
+          for NS in $(echo "${TARGETS:-}" | jq -r 'try (.[] | select(type=="object") | .ns // empty) // empty' 2>/dev/null) "${GL_NAMESPACE:-}"; do
+            [ -n "$NS" ] || continue
+            MASKED=$(echo "$MASKED" | sed -e "s#${NS//./\.}#ns-masked#g")
+          done
           if [ "${GL_LINE#GL=}" = "failed" ] || [ "${BLOB_LINE#BLOB=}" = "failed" ]; then
             echo "$MASKED" | tail -20   # failure detail, masked
           else
@@ -241,7 +287,7 @@ jobs:
           fi
           echo "| repo-${IDX} | ${{ matrix.gl }} → ${GL_LINE#GL=} | ${{ matrix.blob }} → ${BLOB_LINE#BLOB=} |" >> "$GITHUB_STEP_SUMMARY"
           # 'unknown' = mirror_core never reported (crash/broken checkout) — a FAILURE
-          if [ "${GL_LINE#GL=}" = "failed" ] && [ -n "$GL_PAT" ]; then exit 1; fi
+          if [ "${GL_LINE#GL=}" = "failed" ] && { [ -n "$GL_PAT" ] || [ -n "${TARGETS:-}" ]; }; then exit 1; fi
           if [ "${GL_LINE#GL=}" = "unknown" ]; then exit 1; fi
           if [ "${BLOB_LINE#BLOB=}" = "failed" ]; then exit 1; fi
           if [ "${BLOB_LINE#BLOB=}" = "unknown" ]; then exit 1; fi
