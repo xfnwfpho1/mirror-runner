@@ -9,7 +9,7 @@ here while everything sensitive stays private:
 - secrets: this repo's Actions secret store only (encrypted, masked in logs)
 
 The workflow mirrors every repo in the account to GitLab + Netlify-blob
-bundle chains every 6 hours. It prints only indexes/counts publicly.
+bundle chains hourly. It prints only indexes/counts publicly.
 
 See the private `catchall-mirror-kit` repo for full documentation.
 

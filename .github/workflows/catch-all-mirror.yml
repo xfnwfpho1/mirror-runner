@@ -26,7 +26,7 @@ name: Catch-all mirror (all repos)
 
 on:
   schedule:
-    - cron: '23 */6 * * *'
+    - cron: '37 * * * *'   # hourly, off-peak minute (GitHub delays :00-heavy scheduled runs)
   workflow_dispatch:
     inputs:
       force_full:
