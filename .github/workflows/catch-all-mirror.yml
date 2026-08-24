@@ -92,8 +92,18 @@ jobs:
             [ -n "$gl_user" ] || { echo "::error::GL_PAT set but invalid"; exit 1; }
             [ -n "$GL_NAMESPACE" ] || { echo "::error::GL_PAT set but GL_NAMESPACE var missing"; exit 1; }
           fi
-          # multi-target: every token slot referenced by TARGETS must be filled
+          # multi-target: TARGETS must be VALID, non-empty JSON, with every
+          # referenced token slot filled. A typo'd var must kill the run here —
+          # never silently fall through to blob-only mirroring.
           if [ -n "${TARGETS:-}" ]; then
+            if ! echo "$TARGETS" | jq -e 'type=="array"' >/dev/null 2>&1; then
+              echo "::error::TARGETS is set but is not a valid JSON array"
+              exit 1
+            fi
+            if [ "$(echo "$TARGETS" | jq 'length')" -eq 0 ]; then
+              echo "::error::TARGETS is an empty array — that would disable ALL mirroring (unset TARGETS to use the legacy GL_PAT/GL_NAMESPACE config)"
+              exit 1
+            fi
             while IFS= read -r slot; do
               [ -n "$slot" ] || continue
               if [ -z "${!slot:-}" ]; then
@@ -101,13 +111,15 @@ jobs:
                 exit 1
               fi
             done < <(echo "$TARGETS" | jq -r '.[] | select(type=="object") | .pat // empty' 2>/dev/null)
+            # default slots per kind — generic only needs one when the remote
+            # template actually references {pat}
             while IFS= read -r dslot; do
               [ -n "$dslot" ] || continue
               if [ -z "${!dslot:-}" ]; then
                 echo "::error::TARGETS entry references default token slot '$dslot' but the matching repo secret is unset (set it, or name an explicit \"pat\")"
                 exit 1
               fi
-            done < <(echo "$TARGETS" | jq -r '.[] | select(type=="object") | select(.pat == null) | (.kind // "gitlab") | {gitlab:"GL_PAT",github:"GH2_PAT",bitbucket:"BB_PAT",generic:"GENERIC_PAT"}[.] // empty' 2>/dev/null)
+            done < <(echo "$TARGETS" | jq -r '.[] | select(type=="object") | select(.pat == null) | select((.kind // "gitlab") != "generic" or ((.remote // "") | contains("{pat}"))) | (.kind // "gitlab") | {gitlab:"GL_PAT",github:"GH2_PAT",bitbucket:"BB_PAT",generic:"GENERIC_PAT"}[.] // empty' 2>/dev/null)
           fi
           echo "preflight ok"
 
@@ -284,7 +296,7 @@ jobs:
           # error messages leak the name without the owner prefix), plus every
           # target namespace (multi-target labels would leak them otherwise)
           MASKED=$(echo "$OUT" | sed -e "s#${SLUG//./\.}#repo-${IDX}#g" -e "s#${NAME//./\.}#repo-${IDX}#g")
-          for NS in $(echo "${TARGETS:-}" | jq -r 'try (.[] | select(type=="object") | .ns // empty) // empty' 2>/dev/null) "${GL_NAMESPACE:-}"; do
+          for NS in $(echo "${TARGETS:-}" | jq -r 'try (.[] | select(type=="object") | (.ns // .namespace) // empty) // empty' 2>/dev/null) "${GL_NAMESPACE:-}"; do
             [ -n "$NS" ] || continue
             MASKED=$(echo "$MASKED" | sed -e "s#${NS//./\.}#ns-masked#g")
           done
@@ -322,11 +334,12 @@ jobs:
           # mirror job when nothing drifted) are healthy, not failures.
           _JOBS=""
           for _jp in 1 2 3 4 5 6 7 8 9 10; do
-            _PAGE=$(curl -sS -H "Authorization: token $GH_PAT" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/$RUN_ID/jobs?per_page=100&page=$_jp")
-            _N=$(echo "$_PAGE" | jq '.jobs | length')
-            _JOBS="$_JOBS$_PAGE"
-            if [ -z "$_N" ] || [ "$_N" -lt 100 ]; then break; fi
+            _PAGE=$(curl -sS --max-time 30 -H "Authorization: token $GH_PAT" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/$RUN_ID/jobs?per_page=100&page=$_jp" || true)
+            _N=$(echo "$_PAGE" | jq '.jobs | length // 0' 2>/dev/null || echo 0)
+            case "$_N" in ''|*[!0-9]*) _N=0;; esac
+            [ "$_N" -gt 0 ] && _JOBS="$_JOBS$_PAGE"
+            if [ "$_N" -lt 100 ]; then break; fi
           done
           CONCLUSION="$(echo "$_JOBS" | jq -s -r '[.[].jobs[]? | select(.name != "report") | select(.conclusion != "skipped") | .conclusion]
                      | if (length == 0) then "success"
@@ -374,13 +387,19 @@ jobs:
           meta_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -H "Authorization: token $GH_PAT" \
                "https://api.github.com/repos/${OWNER}/${META}")
           if [ "$meta_code" = "200" ]; then
-            git clone -q "https://x-access-token:${GH_PAT}@github.com/${OWNER}/${META}.git" meta
-            ( cd meta
+            ( git clone -q "https://x-access-token:${GH_PAT}@github.com/${OWNER}/${META}.git" meta
+              cd meta
               mkdir -p status
               echo "$STATUS" > status/latest.json
               echo "$STATUS" >> status/history.jsonl
               git add status
               git commit -qm "catchall status ${RUN_ID}: ${CONCLUSION}" || true
-              git push -q origin HEAD ) || echo "meta status push skipped"
+              # the daily fallback + verify drill push to this repo too —
+              # rebase and retry so a racing commit never loses our status
+              for _try in 1 2 3; do
+                git pull -q --rebase origin main 2>/dev/null || true
+                git push -q origin HEAD && break
+                sleep 3
+              done ) || echo "meta status push skipped"
           fi
           echo "report recorded: ${CONCLUSION}"
