@@ -130,8 +130,12 @@ jobs:
           . "$GITHUB_WORKSPACE/kit/scripts/targets_lib.sh"
           RESOLVED_TARGETS="$(targets_resolve)"
 
-          refmap_of() {  # ls-remote filter: heads+tags only, no peeled ^{} lines
-            git ls-remote "$1" 2>/dev/null \
+          refmap_of() {  # ls-remote filter: heads+tags only, no peeled ^{} lines.
+            # NB: `|| true` inside — GitLab's datacenter-IP lottery can 403 an
+            # info/refs (git exits 128); under `set -e -o pipefail` an unguarded
+            # failure would kill the whole plan step. Emptiness is handled by
+            # the callers (retry on the GH side; drift on the target side).
+            { git ls-remote "$1" 2>/dev/null || true; } \
               | awk '$2 ~ /^refs\/(heads|tags)\// && $2 !~ /\^\{\}$/ {print $2":"$1}' | sort
           }
 
@@ -172,7 +176,11 @@ jobs:
               gl="ok"
               while IFS= read -r SPEC; do
                 [ -n "$SPEC" ] || continue
-                t_map=$(refmap_of "$(target_remote "$SPEC" "$name")")
+                t_map=""
+                for i in 1 2 3; do   # absorb the GL lottery's transient 403s
+                  t_map=$(refmap_of "$(target_remote "$SPEC" "$name")")
+                  [ -n "$t_map" ] && break; sleep 2
+                done
                 if [ -z "$t_map" ] || [ "$t_map" != "$gh_map" ]; then
                   gl="drift"; break
                 fi
