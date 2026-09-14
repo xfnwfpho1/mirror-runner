@@ -11,6 +11,16 @@ here while everything sensitive stays private:
 The workflow mirrors every repo in the account to GitLab + Netlify-blob
 bundle chains hourly. It prints only indexes/counts publicly.
 
+Org-repo coverage (G-14): set the `MIRROR_ORGS` repo var (comma-separated
+org logins; **default empty = personal repos only — today's behavior**) to
+also mirror org repos into GitLab subgroups `gh-orgs/<org>/<repo>` on every
+configured GitLab target. Subgroups are NEVER auto-created — while one is
+missing the run stays green, logs a warning, and posts one deduped note per
+24h on the private meta tracking issue; the operator creates the subgroups
+(runbook: `.github/MIRROR-ORGS.md`) and the repos mirror automatically on
+the next cycle. `MIRROR_EXCLUDE` additionally accepts the `org:<login>`
+whole-org form for staged rollouts.
+
 See the private `catchall-mirror-kit` repo for full documentation.
 
 > Note: `.last-run` is updated by every run — it keeps this repo "active" so
