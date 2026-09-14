@@ -27,7 +27,16 @@ name: Catch-all mirror (all repos)
 #          GL_NAMESPACE, NTL_SITE_ID, NTL_STORE, KIT_REPO (private kit repo,
 #          default catchall-mirror-kit), MIRROR_EXCLUDE (optional),
 #          BLOB_PART_MB (default 256), BLOB_MAX_MB (default 2000), META_NAME
-#          (private meta repo, default = owner name).
+#          (private meta repo, default = owner name),
+#          MIRROR_ORGS (optional, DEFAULT EMPTY = personal repos only —
+#          today's behavior, zero risk. Comma-separated org logins to ALSO
+#          mirror, e.g. "claudecode-headless,extreme-velocity": org repos are
+#          enumerated with scope tags and mirrored to gh-orgs/<org>/<repo>
+#          SUBGROUPS on each GitLab target. Subgroups are NEVER auto-created
+#          (R3 BLOCKING): while a subgroup is missing, that org's repos are
+#          SKIPPED with a loud log + a deduped note on the private meta
+#          tracking issue — the operator creates them via the GitLab UI/API
+#          (runbook: .github/MIRROR-ORGS.md) and repos mirror next cycle.)
 #          With TARGETS unset, the legacy single GitLab target
 #          (GL_PAT + GL_NAMESPACE) applies — identical to previous behavior.
 
@@ -51,7 +60,9 @@ permissions:
 jobs:
   plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 15 (was 10): headroom for the org enumeration pass (25 repos ≈ 150-225
+    # API calls — still fast; the ceiling only matters when it's exceeded).
+    timeout-minutes: 15
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       count: ${{ steps.plan.outputs.count }}
@@ -62,6 +73,7 @@ jobs:
       GL_PAT: ${{ secrets.GL_PAT }}
       GL_NAMESPACE: ${{ vars.GL_NAMESPACE }}
       MIRROR_EXCLUDE: ${{ vars.MIRROR_EXCLUDE }}
+      MIRROR_ORGS: ${{ vars.MIRROR_ORGS }}
       NTL_TOKEN: ${{ secrets.NTL_TOKEN }}
       NTL_SITE: ${{ vars.NTL_SITE_ID }}
       NTL_STORE: ${{ vars.NTL_STORE }}
@@ -70,6 +82,7 @@ jobs:
       GH2_PAT: ${{ secrets.GH2_PAT }}
       BB_PAT: ${{ secrets.BB_PAT }}
       GENERIC_PAT: ${{ secrets.GENERIC_PAT }}
+      META_NAME: ${{ vars.META_NAME }}
       FORCE_FULL: ${{ inputs.force_full }}
     steps:
       - name: Checkout kit (private)
@@ -135,12 +148,102 @@ jobs:
             repos=$(echo "$repos" | jq -c --argjson pg "$page" '. + $pg')
             [ "$(echo "$page" | jq 'length')" -lt 100 ] && break
           done
-          total=$(echo "$repos" | jq 'length')
 
           # target resolution is SHARED with mirror_core (one parser, vendored
           # in the kit) — legacy GL_PAT/GL_NAMESPACE applies when TARGETS unset
           . "$GITHUB_WORKSPACE/kit/scripts/targets_lib.sh"
           RESOLVED_TARGETS="$(targets_resolve)"
+
+          # ---- org repos (G-14; gated by MIRROR_ORGS — empty var = today's ----
+          # ---- personal-only behavior, zero risk) --------------------------------
+          ORGS_PLANNED=""; ORGS_SKIPPED=""; ORG_REPOS=0; ORG_NOTE_LINES=""
+          if [ -n "${MIRROR_ORGS:-}" ]; then
+            # v1: the gh-orgs/<org> layout is a GitLab subgroup construct — org
+            # repos need EVERY resolved target to be gitlab-kind. Mixed kinds
+            # → orgs skipped with a warning, never a failed run.
+            NON_GITLAB=$(printf '%s\n' "$RESOLVED_TARGETS" | grep . | grep -cv '^gitlab:' || true)
+            if [ "${NON_GITLAB:-0}" -gt 0 ]; then
+              echo "::warning::org mirror: MIRROR_ORGS is set but a non-gitlab target is configured — org repos are unsupported there in v1; ALL org repos skipped this cycle (never fail the run)"
+              ORGS_SKIPPED=" (non-gitlab target configured)"
+            else
+              for org in $(echo "$MIRROR_ORGS" | tr ',' ' '); do
+                [ -n "$org" ] || continue
+                # Subgroup existence per gitlab target. NEVER auto-created
+                # (R3 BLOCKING): 404 = definitively absent → skip the org's
+                # repos + log + note the private meta tracking issue; the
+                # operator creates the subgroup (runbook MIRROR-ORGS.md) and
+                # the repos mirror on a later cycle. 403/5xx = the WAF
+                # lottery → retry.
+                missing=""
+                while IFS= read -r SPEC; do
+                  [ -n "$SPEC" ] || continue
+                  ns=$(target_field "$SPEC" ns)
+                  tok=$(target_field "$SPEC" token)
+                  api=$(target_api_base "$SPEC")
+                  enc=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "${ns}/gh-orgs/${org}")
+                  found=""
+                  for i in 1 2 3; do
+                    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -H "PRIVATE-TOKEN: $tok" "$api/groups/$enc" || true)
+                    if [ "$code" = "200" ]; then found=1; break; fi
+                    if [ "$code" = "404" ]; then break; fi
+                    sleep 2
+                  done
+                  [ "$found" = "1" ] || missing="${missing} ${ns}/gh-orgs/${org}"
+                done <<< "$RESOLVED_TARGETS"
+                if [ -n "$missing" ]; then
+                  ORGS_SKIPPED="${ORGS_SKIPPED} ${org}"
+                  ORG_NOTE_LINES="${ORG_NOTE_LINES}"$'\n'"- org '${org}': missing GitLab subgroup(s):${missing}"
+                  echo "::warning::org mirror: org '${org}' SKIPPED — GitLab subgroup 'gh-orgs/${org}' missing. Operator: create it (runbook .github/MIRROR-ORGS.md; full paths on the private meta tracking issue). Repos mirror automatically on a later cycle."
+                else
+                  ORGS_PLANNED="${ORGS_PLANNED} ${org}"
+                  for p in $(seq 1 10); do
+                    page=$(gh_api "orgs/${org}/repos?per_page=100&page=$p&type=all")
+                    # per-page jq trap: an error object (404 org, transport)
+                    # must NOT be merged as a repo array — guarded BEFORE merge
+                    if ! printf '%s' "$page" | jq -e 'type=="array"' >/dev/null 2>&1; then
+                      echo "::warning::org mirror: org '${org}' repo list fetch failed — org skipped this cycle (never fail the run)"
+                      break
+                    fi
+                    repos=$(echo "$repos" | jq -c --argjson pg "$page" --arg org "$org" '. + ($pg | map(. + {scope: ("org:" + $org)}))')
+                    [ "$(echo "$page" | jq 'length')" -lt 100 ] && break
+                  done
+                fi
+              done
+            fi
+          fi
+          total=$(echo "$repos" | jq 'length')
+
+          org_missing_note() { # <detail-lines> → deduped (24h) note on the private meta tracking issue
+            local detail="$1" miid last age_h
+            if [ -z "${META_NAME:-}" ]; then
+              echo "org-mirror: META_NAME unset — missing-subgroup detail stays in this (redacted) public log" >&2
+              return 0
+            fi
+            miid=$(gh_api "repos/${GITHUB_REPOSITORY_OWNER}/${META_NAME}/issues?state=open&labels=catchall-failure&per_page=5" \
+              | jq -r '[.[].number][0] // empty' 2>/dev/null || true)
+            if [ -z "${miid:-}" ]; then
+              echo "org-mirror: no open catchall-failure tracking issue — detail stays in this (redacted) public log" >&2
+              return 0
+            fi
+            last=$(gh_api "repos/${GITHUB_REPOSITORY_OWNER}/${META_NAME}/issues/${miid}/comments?per_page=20" \
+              | jq -r '[.[] | select(.body | startswith("[org-mirror]")) | .created_at] | max // empty' 2>/dev/null || true)
+            if [ -n "${last:-}" ]; then
+              age_h=$(( ($(date +%s) - $(date -u -d "$last" +%s)) / 3600 )) || age_h=999999
+              if [ "${age_h:-0}" -lt 24 ]; then
+                echo "org-mirror: missing-subgroup note deduped (last note ${age_h}h ago)" >&2
+                return 0
+              fi
+            fi
+            NOTE_BODY="[org-mirror] subgroups missing as of $(date -u +%FT%TZ) — org repos are SKIPPED (never failed) until they exist:${detail}"$'\n\n'"Runbook: mirror-runner/.github/MIRROR-ORGS.md — create each subgroup under the listed namespace (GitLab UI: New group → subgroup; or POST /api/v4/groups with parent_id). Repos mirror automatically on the next cycle."
+            jq -n --arg b "$NOTE_BODY" '{body: $b}' \
+              | curl -sS -o /dev/null -f -X POST -H "Authorization: token $GH_PAT" \
+                  -H "Content-Type: application/json" --data-binary @- \
+                  "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${META_NAME}/issues/${miid}/comments" \
+              || echo "::warning::org-mirror: meta tracking-issue note failed to post"
+          }
+          if [ -n "$ORG_NOTE_LINES" ]; then
+            org_missing_note "$ORG_NOTE_LINES" || true
+          fi
 
           refmap_of() {  # ls-remote filter: heads+tags only, no peeled ^{} lines.
             # NB: `|| true` inside — GitLab's datacenter-IP lottery can 403 an
@@ -152,9 +255,18 @@ jobs:
           }
 
           matrix="[]"; count=0; skipped=0; empty=0; idx=0
-          for slug in $(echo "$repos" | jq -r '.[] | select(.archived==false) | .full_name'); do
+          # scope-aware loop (@tsv: personal entries carry no scope → default
+          # "personal" — with MIRROR_ORGS empty the iteration set and every
+          # branch below are IDENTICAL to the old personal-only loop).
+          while IFS=$'\t' read -r slug scope; do
+            [ -n "$slug" ] || continue
+            org=""
+            case "$scope" in org:*) org="${scope#org:}" ;; esac
             name="${slug#*/}"
-            if [[ ",${MIRROR_EXCLUDE}," == *",${name},"* || ",${MIRROR_EXCLUDE}," == *",${slug},"* ]]; then
+            # MIRROR_EXCLUDE: legacy bare-name / exact-slug forms (unchanged)
+            # + the new org:<login> whole-org form (staged rollouts)
+            if [[ ",${MIRROR_EXCLUDE}," == *",${name},"* || ",${MIRROR_EXCLUDE}," == *",${slug},"* ]] \
+               || { [ -n "$org" ] && [[ ",${MIRROR_EXCLUDE}," == *",org:${org},"* ]]; }; then
               skipped=$((skipped+1)); continue
             fi
 
@@ -186,11 +298,16 @@ jobs:
             gl="disabled"   # no targets configured: never flag as needing repair
             if [ -n "$RESOLVED_TARGETS" ]; then
               gl="ok"
+              # org repos live at <ns>/gh-orgs/<org>/<name> on each target —
+              # the path rides the NAME for ls-remote (identical URL shape to
+              # what the mirror job produces via ns-scoping)
+              tname="$name"
+              if [ -n "$org" ]; then tname="gh-orgs/${org}/${name}"; fi
               while IFS= read -r SPEC; do
                 [ -n "$SPEC" ] || continue
                 t_map=""
                 for i in 1 2 3; do   # absorb the GL lottery's transient 403s
-                  t_map=$(refmap_of "$(target_remote "$SPEC" "$name")")
+                  t_map=$(refmap_of "$(target_remote "$SPEC" "$tname")")
                   [ -n "$t_map" ] && break; sleep 2
                 done
                 if [ -z "$t_map" ] || [ "$t_map" != "$gh_map" ]; then
@@ -210,26 +327,32 @@ jobs:
 
             if [ "${FORCE_FULL}" = "true" ] || { [ "$gl" != "ok" ] && [ "$gl" != "disabled" ]; } || { [ "$blob" != "ok" ] && [ "$blob" != "disabled" ]; }; then
               idx=$((idx+1))
+              if [ -n "$org" ]; then ORG_REPOS=$((ORG_REPOS+1)); fi
               matrix=$(echo "$matrix" | jq -c --arg slug_b64 "$(echo -n "$slug" | base64 -w0)" --arg name_b64 "$(echo -n "$name" | base64 -w0)" \
                 --arg defbr_b64 "$(echo -n "$defbr" | base64 -w0)" --arg gl "$gl" --arg blob "$blob" \
+                --arg org_b64 "$(echo -n "${org}" | base64 -w0)" \
                 --arg sha "$defsha" --argjson i "$idx" \
-                '. += [{i:$i, slug_b64:$slug_b64, name_b64:$name_b64, default_branch_b64:$defbr_b64, gl:$gl, blob:$blob, default_sha:$sha}]')
+                '. += [{i:$i, slug_b64:$slug_b64, name_b64:$name_b64, default_branch_b64:$defbr_b64, gl:$gl, blob:$blob, org_b64:$org_b64, default_sha:$sha}]')
               count=$((count+1))
             else
               skipped=$((skipped+1))
             fi
-          done
+          done < <(echo "$repos" | jq -r '.[] | select(.archived==false) | [.full_name, (.scope // "personal")] | @tsv')
 
           echo "matrix=$(echo "$matrix" | jq -c '{include: .}')" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "total=$total" >> "$GITHUB_OUTPUT"
           echo "skipped=$((skipped+empty))" >> "$GITHUB_OUTPUT"
-          # public summary: COUNTS ONLY (no repo names)
+          # public summary: COUNTS ONLY (no repo names; org logins are public
+          # orgs — allowed; target namespaces are NOT)
           {
             echo "## Catch-all mirror plan"
             echo ""
             echo "- repos: **$total** total — **$((skipped+empty))** in sync/skipped/empty, **$count** need attention"
             echo "- mode: targets=$([ -n "$RESOLVED_TARGETS" ] && echo "$(echo "$RESOLVED_TARGETS" | grep -c . || true)" || echo OFF), blobs=$([ -n "$NTL_TOKEN" ] && echo enabled || echo OFF)"
+            if [ -n "${MIRROR_ORGS:-}" ]; then
+              echo "- org mode: **on** — orgs planned:${ORGS_PLANNED:- none}; skipped (subgroup missing / unsupported):${ORGS_SKIPPED:- none}; org repos needing attention: ${ORG_REPOS}"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   mirror:
@@ -273,12 +396,41 @@ jobs:
           DEFBR_B64: ${{ matrix.default_branch_b64 }}
           DEFSHA: ${{ matrix.default_sha }}
           GLSTATE: ${{ matrix.gl }}
+          ORG_B64: ${{ matrix.org_b64 }}
           IDX: ${{ matrix.i }}
         run: |
           set -euo pipefail
           SLUG=$(echo "$SLUG_B64" | base64 -d)
           NAME=$(echo "$NAME_B64" | base64 -d)
           DEFBR=$(echo "$DEFBR_B64" | base64 -d)
+          ORG=$(echo "${ORG_B64:-}" | base64 -d 2>/dev/null || true)
+          # G-14 org scoping: rebuild the target specs with ns/gh-orgs/<org>
+          # so mirror_core pushes into the org SUBGROUP with its EXISTING
+          # semantics — the namespace carries the path, NAME stays the bare
+          # repo name, so project auto-create (POST /projects, namespace_id =
+          # full path) and the default_branch PUT address the subgroup
+          # correctly. The kit itself is UNTOUCHED. TARGET_SPECS (checked
+          # first by targets_resolve) wins over TARGETS; tokens stay in env,
+          # never in the matrix or logs.
+          if [ -n "${ORG:-}" ]; then
+            . "$GITHUB_WORKSPACE/kit/scripts/targets_lib.sh"
+            ORG_SPECS=""
+            while IFS= read -r SPEC; do
+              [ -n "$SPEC" ] || continue
+              K=$(target_field "$SPEC" kind)
+              NS=$(target_field "$SPEC" ns)
+              TOK=$(target_field "$SPEC" token)
+              H=$(target_field "$SPEC" host)
+              [ -n "$H" ] || H=$(targets_default_host "$K")
+              ORG_SPECS="${ORG_SPECS}${K}:${NS}/gh-orgs/${ORG}:${TOK}@${H}"$'\n'
+            done < <(targets_resolve)
+            ORG_LINES=$(printf '%s' "$ORG_SPECS" | grep . || true)
+            if [ -z "$ORG_LINES" ] || printf '%s' "$ORG_LINES" | grep -qv '^gitlab:'; then
+              echo "::error::repo-${IDX}: org target rebuild failed (no usable gitlab targets) — plan/mirror inconsistency; refusing to guess the target path"
+              exit 1
+            fi
+            export TARGET_SPECS="$ORG_SPECS"
+          fi
           # expect-sha early-exit is only safe when every target was already
           # verified in-sync by plan (gl=ok). If gl=drift we MUST do the work.
           EXTRA=""
